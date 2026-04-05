@@ -19,6 +19,7 @@ import logging
 
 from services import snowflake_dilution as sf
 from services import sec_xbrl as edgar
+from services import sec_filings as sf_lake
 from services import analysis
 
 logging.basicConfig(level=logging.INFO)
@@ -129,7 +130,13 @@ def fmt_pct(n):
 # --- Helper: ingest a company ---
 
 def ingest_company(ticker: str) -> bool:
-    """Resolve ticker, fetch EDGAR data, store in Snowflake. Returns True on success."""
+    """Resolve ticker, fetch EDGAR data, store in Snowflake. Returns True on success.
+
+    Full pipeline:
+      1. XBRL structured data (diluted/basic shares, buybacks)
+      2. Filing document download (10-K/10-Q full text → SEC_FILINGS data lake)
+      3. Cortex AI extraction (LLM-based share/split parsing → FILING_FACTS)
+    """
     company = edgar.resolve_ticker_to_cik(ticker)
     if not company:
         st.error(f"Could not resolve ticker '{ticker}' via SEC EDGAR.")
@@ -140,6 +147,7 @@ def ingest_company(ticker: str) -> bool:
     ipo_date = company.get("ipo_date")
 
     try:
+        # --- Step 1: XBRL structured data ---
         data = edgar.ingest_company(cik, ticker.upper())
 
         sf.insert_diluted_shares(data["diluted_shares"])
@@ -159,8 +167,57 @@ def ingest_company(ticker: str) -> bool:
             status="SUCCESS", ipo_date=ipo_date,
         )
         st.success(
-            f"Ingested {total_points} data points for {entity_name} ({ticker.upper()})"
+            f"Ingested {total_points} XBRL data points for {entity_name} ({ticker.upper()})"
         )
+
+        # --- Step 2: Filing document download ---
+        st.info("Downloading SEC filing documents...")
+        filings = edgar.get_filing_list(cik, after_date=ipo_date)
+        filings_inserted = 0
+        filings_skipped = 0
+        for filing in filings:
+            accession = filing["accession_number"]
+            primary_doc = filing["primary_document"]
+            if sf_lake.filing_exists(cik, accession):
+                filings_skipped += 1
+                continue
+            text = edgar.fetch_filing_text(cik, accession, primary_doc)
+            if not text:
+                continue
+            accession_clean = accession.replace("-", "")
+            filing_url = (
+                f"https://www.sec.gov/Archives/edgar/data/"
+                f"{cik.zfill(10)}/{accession_clean}/{primary_doc}"
+            )
+            inserted = sf_lake.insert_filing(
+                cik=cik,
+                ticker=ticker.upper(),
+                entity_name=entity_name,
+                accession_number=accession,
+                form_type=filing["form_type"],
+                filed_date=filing.get("filed_date"),
+                report_date=filing.get("report_date", ""),
+                primary_document=primary_doc,
+                filing_url=filing_url,
+                document_text=text,
+            )
+            if inserted:
+                filings_inserted += 1
+        st.success(
+            f"Filing documents: {filings_inserted} downloaded, "
+            f"{filings_skipped} already cached (of {len(filings)} total)"
+        )
+
+        # --- Step 3: Cortex AI extraction (shares + splits) ---
+        st.info("Running Cortex AI extraction on filings...")
+        facts_inserted = sf.run_cortex_extraction(ticker.upper())
+        st.success(f"Cortex AI: extracted facts from {facts_inserted} filing(s)")
+
+        # --- Step 4: Q4 net income / EPS extraction from 10-K filings ---
+        st.info("Extracting Q4 financials from 10-K filings...")
+        q4_updated = sf.run_q4_extraction(ticker.upper())
+        st.success(f"Q4 extraction: updated {q4_updated} 10-K filing(s)")
+
         return True
 
     except Exception as e:

@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from services import snowflake_dilution as sf
 from services import sec_xbrl as edgar
+from services import sec_filings as sf_lake
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,7 +30,7 @@ MONITOR_KEY = "dilution_monitor"
 
 
 def ingest_ticker(ticker: str) -> bool:
-    """Ingest a single ticker. Returns True on success."""
+    """Ingest a single ticker (XBRL + filings + Cortex). Returns True on success."""
     logger.info(f"--- Ingesting {ticker} ---")
 
     ingestion = sf.get_ingestion_status(ticker)
@@ -43,6 +44,7 @@ def ingest_ticker(ticker: str) -> bool:
         cik = company["cik"]
 
     try:
+        # Step 1: XBRL structured data
         data = edgar.ingest_company(cik, ticker)
 
         d_count = sf.insert_diluted_shares(data["diluted_shares"])
@@ -59,10 +61,51 @@ def ingest_ticker(ticker: str) -> bool:
 
         sf.upsert_ingestion_log(ticker, cik, entity_name, status="SUCCESS")
         logger.info(
-            f"  {ticker}: {total_new} new data points "
+            f"  {ticker}: {total_new} new XBRL data points "
             f"(diluted={d_count}, basic={b_count}, "
             f"buyback_activity={ba_count}, buyback_programs={bp_count})"
         )
+
+        # Step 2: Filing document download
+        ipo_date = sf.get_ipo_date(ticker)
+        filings = edgar.get_filing_list(cik, after_date=ipo_date)
+        filings_inserted = 0
+        for filing in filings:
+            accession = filing["accession_number"]
+            primary_doc = filing["primary_document"]
+            if sf_lake.filing_exists(cik, accession):
+                continue
+            text = edgar.fetch_filing_text(cik, accession, primary_doc)
+            if not text:
+                continue
+            accession_clean = accession.replace("-", "")
+            filing_url = (
+                f"https://www.sec.gov/Archives/edgar/data/"
+                f"{cik.zfill(10)}/{accession_clean}/{primary_doc}"
+            )
+            if sf_lake.insert_filing(
+                cik=cik,
+                ticker=ticker.upper(),
+                entity_name=entity_name,
+                accession_number=accession,
+                form_type=filing["form_type"],
+                filed_date=filing.get("filed_date"),
+                report_date=filing.get("report_date", ""),
+                primary_document=primary_doc,
+                filing_url=filing_url,
+                document_text=text,
+            ):
+                filings_inserted += 1
+        logger.info(f"  {ticker}: {filings_inserted} new filing documents downloaded")
+
+        # Step 3: Cortex AI extraction (shares + splits)
+        facts_inserted = sf.run_cortex_extraction(ticker.upper())
+        logger.info(f"  {ticker}: {facts_inserted} filing facts extracted via Cortex AI")
+
+        # Step 4: Q4 net income / EPS extraction from 10-K filings
+        q4_updated = sf.run_q4_extraction(ticker.upper())
+        logger.info(f"  {ticker}: {q4_updated} 10-K filings updated with Q4 data")
+
         return True
 
     except Exception as e:

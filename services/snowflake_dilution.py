@@ -715,6 +715,180 @@ def complete_queued_ingestion(
     )
 
 
+# ---------------------------------------------------------------------------
+# Cortex AI filing extraction
+# ---------------------------------------------------------------------------
+
+
+def run_cortex_extraction(ticker: str) -> int:
+    """Run Cortex AI extraction on SEC filings and insert results into FILING_FACTS.
+
+    Processes all filings in SEC_FILINGS.PUBLIC.FILINGS for the given ticker
+    that don't already have a FILING_FACTS row.  Uses targeted text windows
+    (cover, shares-outstanding section, diluted section, split/events, end)
+    and SNOWFLAKE.CORTEX.AI_COMPLETE with llama3.3-70b.
+
+    Returns the number of new FILING_FACTS rows inserted.
+    """
+    sql = (
+        "INSERT INTO DILUTION_MONITOR.PUBLIC.FILING_FACTS\n"
+        "  (TICKER, FORM_TYPE, PERIOD_END, DILUTED_SHARES_REPORTED, BASIC_SHARES_REPORTED,\n"
+        "   STOCK_SPLIT_RATIO, STOCK_SPLIT_DATE,\n"
+        "   RAW_AI_RESPONSE, EXTRACTED_AT, ACCESSION_NUMBER)\n"
+        "WITH windows AS (\n"
+        "  SELECT\n"
+        "    f.TICKER, f.CIK, f.ACCESSION_NUMBER, f.FORM_TYPE, f.REPORT_DATE, f.DOCUMENT_LENGTH,\n"
+        "    LEFT(f.DOCUMENT_TEXT, 10000) AS w1,\n"
+        "    CASE WHEN POSITION('shares outstanding' IN LOWER(f.DOCUMENT_TEXT)) > 0\n"
+        "         THEN SUBSTR(f.DOCUMENT_TEXT, GREATEST(1, POSITION('shares outstanding' IN LOWER(f.DOCUMENT_TEXT)) - 2000), 8000)\n"
+        "         ELSE '' END AS w2,\n"
+        "    CASE WHEN POSITION('diluted' IN LOWER(f.DOCUMENT_TEXT)) > 0\n"
+        "         THEN SUBSTR(f.DOCUMENT_TEXT, GREATEST(1, POSITION('diluted' IN LOWER(f.DOCUMENT_TEXT)) - 2000), 8000)\n"
+        "         ELSE '' END AS w3,\n"
+        "    CASE WHEN POSITION('stock split' IN LOWER(f.DOCUMENT_TEXT)) > 0\n"
+        "         THEN SUBSTR(f.DOCUMENT_TEXT, GREATEST(1, POSITION('stock split' IN LOWER(f.DOCUMENT_TEXT)) - 3000), 10000)\n"
+        "         WHEN POSITION('split' IN LOWER(f.DOCUMENT_TEXT)) > 0\n"
+        "         THEN SUBSTR(f.DOCUMENT_TEXT, GREATEST(1, POSITION('split' IN LOWER(f.DOCUMENT_TEXT)) - 2000), 8000)\n"
+        "         ELSE '' END AS w4,\n"
+        "    RIGHT(f.DOCUMENT_TEXT, 10000) AS w5\n"
+        "  FROM SEC_FILINGS.PUBLIC.FILINGS f\n"
+        "  WHERE f.TICKER = %s\n"
+        "    AND f.ACCESSION_NUMBER NOT IN (\n"
+        "      SELECT ACCESSION_NUMBER FROM DILUTION_MONITOR.PUBLIC.FILING_FACTS WHERE TICKER = %s\n"
+        "    )\n"
+        "),\n"
+        "extracted AS (\n"
+        "  SELECT TICKER, ACCESSION_NUMBER, FORM_TYPE, REPORT_DATE,\n"
+        "    SNOWFLAKE.CORTEX.AI_COMPLETE('llama3.3-70b',\n"
+        "      'You are analyzing excerpts from a SEC filing. Extract these facts. Return ONLY valid JSON, no markdown.\\n'\n"
+        "      || 'Fields:\\n'\n"
+        "      || '- stock_splits: array of {ratio, effective_date}. Only actual stock splits declared or completed in this filing period. Empty array if none.\\n'\n"
+        "      || '- diluted_shares: weighted average diluted shares for the most recent period. Full number (not in thousands). null if not found.\\n'\n"
+        "      || '- basic_shares: basic/common shares outstanding as of reporting date. Full number. null if not found.\\n'\n"
+        "      || 'IMPORTANT: If table header says \"in thousands\", multiply values by 1,000. If \"in millions\", multiply by 1,000,000.\\n'\n"
+        "      || '--- COVER ---\\n' || w1\n"
+        "      || '\\n--- SHARES OUTSTANDING ---\\n' || w2\n"
+        "      || '\\n--- DILUTED SHARES ---\\n' || w3\n"
+        "      || '\\n--- SPLIT/EVENTS ---\\n' || w4\n"
+        "      || '\\n--- END ---\\n' || w5,\n"
+        "      {'max_tokens': 500, 'temperature': 0}\n"
+        "    ) AS ai_raw\n"
+        "  FROM windows\n"
+        "),\n"
+        "parsed AS (\n"
+        "  SELECT TICKER, ACCESSION_NUMBER, FORM_TYPE, REPORT_DATE, ai_raw,\n"
+        "    TRY_PARSE_JSON(REPLACE(REPLACE(ai_raw, '```json', ''), '```', '')) AS j\n"
+        "  FROM extracted\n"
+        ")\n"
+        "SELECT\n"
+        "  TICKER, FORM_TYPE, REPORT_DATE,\n"
+        "  j:diluted_shares::NUMBER AS diluted_shares_reported,\n"
+        "  j:basic_shares::NUMBER AS basic_shares_reported,\n"
+        "  CASE WHEN ARRAY_SIZE(j:stock_splits) > 0\n"
+        "       THEN REPLACE(j:stock_splits[0]:ratio::VARCHAR, '-for-', ':')\n"
+        "       ELSE NULL END AS stock_split_ratio,\n"
+        "  CASE WHEN ARRAY_SIZE(j:stock_splits) > 0\n"
+        "       THEN TRY_TO_DATE(j:stock_splits[0]:effective_date::VARCHAR)\n"
+        "       ELSE NULL END AS stock_split_date,\n"
+        "  ai_raw, CURRENT_TIMESTAMP(), ACCESSION_NUMBER\n"
+        "FROM parsed\n"
+    )
+    try:
+        rows = _execute_no_fetch(sql, (ticker.upper(), ticker.upper()))
+        logger.info(f"Cortex extraction for {ticker}: {rows} filing facts inserted")
+        return rows
+    except Exception as e:
+        logger.error(f"Cortex extraction failed for {ticker}: {e}")
+        raise
+
+
+def run_q4_extraction(ticker: str) -> int:
+    """Run Cortex AI extraction of Q4 net income and EPS from 10-K filings.
+
+    Finds the quarterly results section in 10-K filings and uses
+    llama3.1-70b to extract Q4-specific financial data.  Updates
+    existing FILING_FACTS rows with Q4_NET_INCOME and Q4_EPS.
+
+    Returns the number of rows updated.
+    """
+    sql = (
+        "UPDATE DILUTION_MONITOR.PUBLIC.FILING_FACTS ff\n"
+        "SET\n"
+        "  Q4_NET_INCOME = parsed.q4_net_income,\n"
+        "  Q4_EPS = parsed.q4_eps\n"
+        "FROM (\n"
+        "  WITH quarterly_filings AS (\n"
+        "    SELECT\n"
+        "      ff2.TICKER,\n"
+        "      ff2.ACCESSION_NUMBER,\n"
+        "      ff2.PERIOD_END,\n"
+        "      f.DOCUMENT_TEXT,\n"
+        "      GREATEST(\n"
+        "        COALESCE(POSITION('Quarterly Results' IN f.DOCUMENT_TEXT), 0),\n"
+        "        COALESCE(POSITION('QUARTERLY RESULTS' IN f.DOCUMENT_TEXT), 0),\n"
+        "        COALESCE(POSITION('Selected Quarterly' IN f.DOCUMENT_TEXT), 0),\n"
+        "        COALESCE(POSITION('SELECTED QUARTERLY' IN f.DOCUMENT_TEXT), 0),\n"
+        "        COALESCE(POSITION('Quarterly Financial Data' IN f.DOCUMENT_TEXT), 0),\n"
+        "        COALESCE(POSITION('QUARTERLY FINANCIAL DATA' IN f.DOCUMENT_TEXT), 0),\n"
+        "        COALESCE(POSITION('Supplemental Quarterly' IN f.DOCUMENT_TEXT), 0),\n"
+        "        COALESCE(POSITION('SUPPLEMENTAL QUARTERLY' IN f.DOCUMENT_TEXT), 0)\n"
+        "      ) AS section_pos\n"
+        "    FROM DILUTION_MONITOR.PUBLIC.FILING_FACTS ff2\n"
+        "    JOIN SEC_FILINGS.PUBLIC.FILINGS f\n"
+        "      ON ff2.TICKER = f.TICKER AND ff2.ACCESSION_NUMBER = f.ACCESSION_NUMBER\n"
+        "    WHERE ff2.FORM_TYPE = '10-K'\n"
+        "      AND ff2.TICKER = %s\n"
+        "      AND ff2.Q4_NET_INCOME IS NULL\n"
+        "  ),\n"
+        "  filings_with_section AS (\n"
+        "    SELECT * FROM quarterly_filings WHERE section_pos > 0\n"
+        "  ),\n"
+        "  extraction AS (\n"
+        "    SELECT\n"
+        "      TICKER, ACCESSION_NUMBER,\n"
+        "      SNOWFLAKE.CORTEX.COMPLETE(\n"
+        "        'llama3.1-70b',\n"
+        "        CONCAT(\n"
+        "          'Extract Q4 quarterly financial data from this 10-K annual report section. ',\n"
+        "          'The fiscal year ends on ', TO_CHAR(PERIOD_END, 'YYYY-MM-DD'), '. ',\n"
+        "          'Q4 is the LAST quarter of the fiscal year (the three months ending on the fiscal year end date). ',\n"
+        "          'Find: 1) Q4 net income or net loss in thousands of dollars. 2) Q4 diluted net income/loss per share (EPS). ',\n"
+        "          'Losses should be NEGATIVE numbers. ',\n"
+        "          'Return ONLY valid JSON: {\"q4_net_income_thousands\": <integer>, \"q4_diluted_eps\": <number>} ',\n"
+        "          'If you cannot find these values, return: {\"q4_net_income_thousands\": null, \"q4_diluted_eps\": null} ',\n"
+        "          'Here is the quarterly data section: ',\n"
+        "          SUBSTR(DOCUMENT_TEXT, section_pos, 6000)\n"
+        "        )\n"
+        "      ) AS raw_result\n"
+        "    FROM filings_with_section\n"
+        "  ),\n"
+        "  json_extracted AS (\n"
+        "    SELECT TICKER, ACCESSION_NUMBER, raw_result,\n"
+        r"      REGEXP_SUBSTR(raw_result, '\\{[^{}]*\"q4_net_income_thousands\"[^{}]*\\}') AS json_str"
+        "\n"
+        "    FROM extraction\n"
+        "  )\n"
+        "  SELECT\n"
+        "    TICKER, ACCESSION_NUMBER,\n"
+        "    TRY_CAST(PARSE_JSON(json_str):q4_net_income_thousands::VARCHAR AS INTEGER) AS q4_net_income,\n"
+        "    TRY_CAST(PARSE_JSON(json_str):q4_diluted_eps::VARCHAR AS FLOAT) AS q4_eps\n"
+        "  FROM json_extracted\n"
+        "  WHERE json_str IS NOT NULL\n"
+        ") parsed\n"
+        "WHERE ff.TICKER = parsed.TICKER\n"
+        "  AND ff.ACCESSION_NUMBER = parsed.ACCESSION_NUMBER\n"
+        "  AND parsed.q4_net_income IS NOT NULL\n"
+        "  AND parsed.q4_eps IS NOT NULL\n"
+    )
+    try:
+        rows = _execute_no_fetch(sql, (ticker.upper(),))
+        logger.info(f"Q4 extraction for {ticker}: {rows} filing facts updated")
+        return rows
+    except Exception as e:
+        logger.error(f"Q4 extraction failed for {ticker}: {e}")
+        raise
+
+
 def _get_github_pat() -> Optional[str]:
     """Read GitHub PAT from Streamlit secrets or environment variable."""
     try:
