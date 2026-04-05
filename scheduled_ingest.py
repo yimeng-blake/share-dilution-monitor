@@ -25,6 +25,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+MONITOR_KEY = "dilution_monitor"
+
 
 def ingest_ticker(ticker: str) -> bool:
     """Ingest a single ticker. Returns True on success."""
@@ -73,8 +75,34 @@ def ingest_ticker(ticker: str) -> bool:
         return False
 
 
+def process_queue():
+    """Check the INGESTION_QUEUE for pending requests and process them."""
+    queued = sf.claim_pending_ingestions(MONITOR_KEY)
+    if not queued:
+        return
+    logger.info(f"Processing {len(queued)} queued ingestion request(s)")
+    for row in queued:
+        ticker = row["TICKER"]
+        queue_id = row["ID"]
+        try:
+            ok = ingest_ticker(ticker)
+            sf.complete_queued_ingestion(
+                queue_id,
+                status="COMPLETED" if ok else "FAILED",
+                error_message=None if ok else "ingest_ticker returned False",
+            )
+        except Exception as e:
+            logger.error(f"[{ticker}] Queued ingestion failed: {e}")
+            sf.complete_queued_ingestion(
+                queue_id, status="FAILED", error_message=str(e)[:2000],
+            )
+
+
 def main():
     specific_tickers = [t.upper() for t in sys.argv[1:]] if len(sys.argv) > 1 else None
+
+    # Always process the cross-app queue first
+    process_queue()
 
     if specific_tickers:
         tickers = specific_tickers

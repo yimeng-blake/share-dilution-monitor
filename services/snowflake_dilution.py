@@ -7,6 +7,7 @@ Watchlist operations use the centralised WATCHLIST_HUB.PUBLIC.COMPANIES table.
 """
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -642,4 +643,133 @@ def get_buyback_programs(ticker: str) -> list[dict]:
         "ORDER BY PERIOD_END",
         (ticker.upper(),),
     )
+
+
+# ---------------------------------------------------------------------------
+# Ingestion queue (cross-app)
+# ---------------------------------------------------------------------------
+
+
+def enqueue_ingestions(ticker: str, requested_by: str) -> int:
+    """Insert PENDING ingestion requests for all registered monitors.
+
+    Reads WATCHLIST_HUB.PUBLIC.MONITOR_REGISTRY to discover monitors, then
+    inserts one PENDING row per monitor into INGESTION_QUEUE (skipping if a
+    PENDING row already exists for that ticker+monitor combo).
+
+    Returns the number of rows inserted.
+    """
+    monitors = _execute(
+        "SELECT MONITOR_ID FROM WATCHLIST_HUB.PUBLIC.MONITOR_REGISTRY "
+        "WHERE ACTIVE = TRUE"
+    )
+    inserted = 0
+    for m in monitors:
+        monitor_key = m["MONITOR_ID"]
+        _execute_no_fetch(
+            "INSERT INTO WATCHLIST_HUB.PUBLIC.INGESTION_QUEUE "
+            "(TICKER, MONITOR, STATUS, REQUESTED_BY) "
+            "SELECT %s, %s, 'PENDING', %s "
+            "WHERE NOT EXISTS ("
+            "  SELECT 1 FROM WATCHLIST_HUB.PUBLIC.INGESTION_QUEUE "
+            "  WHERE TICKER = %s AND MONITOR = %s AND STATUS = 'PENDING'"
+            ")",
+            (ticker.upper(), monitor_key, requested_by,
+             ticker.upper(), monitor_key),
+        )
+        inserted += 1
+    return inserted
+
+
+def claim_pending_ingestions(monitor: str) -> list[dict]:
+    """Claim all PENDING queue rows for a given monitor.
+
+    Sets STATUS = 'RUNNING' and STARTED_AT = now, then returns the claimed rows.
+    """
+    now = datetime.now(timezone.utc)
+    _execute_no_fetch(
+        "UPDATE WATCHLIST_HUB.PUBLIC.INGESTION_QUEUE "
+        "SET STATUS = 'RUNNING', STARTED_AT = %s "
+        "WHERE MONITOR = %s AND STATUS = 'PENDING'",
+        (now, monitor),
+    )
+    return _execute(
+        "SELECT ID, TICKER, MONITOR, REQUESTED_BY, REQUESTED_AT "
+        "FROM WATCHLIST_HUB.PUBLIC.INGESTION_QUEUE "
+        "WHERE MONITOR = %s AND STATUS = 'RUNNING' AND STARTED_AT = %s "
+        "ORDER BY REQUESTED_AT",
+        (monitor, now),
+    )
+
+
+def complete_queued_ingestion(
+    queue_id: int, status: str = "COMPLETED", error_message: Optional[str] = None,
+):
+    """Mark a queue row as COMPLETED or FAILED."""
+    now = datetime.now(timezone.utc)
+    _execute_no_fetch(
+        "UPDATE WATCHLIST_HUB.PUBLIC.INGESTION_QUEUE "
+        "SET STATUS = %s, COMPLETED_AT = %s, ERROR_MESSAGE = %s "
+        "WHERE ID = %s",
+        (status, now, error_message, queue_id),
+    )
+
+
+def _get_github_pat() -> Optional[str]:
+    """Read GitHub PAT from Streamlit secrets or environment variable."""
+    try:
+        import streamlit as st
+        pat = st.secrets.get("github", {}).get("pat")
+        if pat:
+            return pat
+    except Exception:
+        pass
+    return os.environ.get("GITHUB_PAT")
+
+
+def trigger_cross_app_ingestion(ticker: str, source_monitor: str):
+    """Dispatch GitHub Actions workflows for all other registered monitors.
+
+    Reads MONITOR_REGISTRY for workflow metadata, then fires a
+    workflow_dispatch event for each monitor except the caller.
+    Falls back silently — the INGESTION_QUEUE serves as backup.
+    """
+    import requests
+
+    pat = _get_github_pat()
+    if not pat:
+        logger.warning("GITHUB_PAT not configured — skipping cross-app dispatch")
+        return
+
+    monitors = _execute(
+        "SELECT MONITOR_ID, GITHUB_REPO, WORKFLOW_FILE, GITHUB_REF "
+        "FROM WATCHLIST_HUB.PUBLIC.MONITOR_REGISTRY "
+        "WHERE ACTIVE = TRUE AND MONITOR_ID != %s",
+        (source_monitor,),
+    )
+
+    for m in monitors:
+        repo = m["GITHUB_REPO"]
+        workflow = m["WORKFLOW_FILE"]
+        ref = m["GITHUB_REF"] or "main"
+        url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow}/dispatches"
+        try:
+            resp = requests.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {pat}",
+                    "Accept": "application/vnd.github.v3+json",
+                },
+                json={"ref": ref, "inputs": {"tickers": ticker.upper()}},
+                timeout=10,
+            )
+            if resp.status_code == 204:
+                logger.info(f"Dispatched {workflow} for {ticker} on {repo}")
+            else:
+                logger.warning(
+                    f"GitHub dispatch failed for {repo}: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(f"GitHub dispatch error for {repo}: {e}")
 

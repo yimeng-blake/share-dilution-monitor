@@ -1,0 +1,41 @@
+name: Daily Dilution Data Ingest
+
+on:
+  schedule:
+    # Run daily at 6:30 AM UTC (after US market hours, after SEC filings settle)
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "Space-separated tickers to ingest (blank = full sweep)"
+        required: false
+        default: ""
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ingestion
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: DILUTION_MONITOR
+          SNOWFLAKE_SCHEMA: PUBLIC
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SEC_EDGAR_USER_AGENT: ${{ secrets.SEC_EDGAR_USER_AGENT }}
+        run: python scheduled_ingest.py ${{ github.event.inputs.tickers }}

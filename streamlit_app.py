@@ -64,6 +64,8 @@ if st.sidebar.button("Add to Watchlist", use_container_width=True):
                     exchange=company.get("exchange", ""),
                 )
                 if added:
+                    sf.enqueue_ingestions(company["ticker"], requested_by="dilution_monitor")
+                    sf.trigger_cross_app_ingestion(company["ticker"], source_monitor="dilution_monitor")
                     st.success(f"Added {company['name']} ({company['ticker']})")
                     st.cache_data.clear()
                     st.rerun()
