@@ -607,3 +607,74 @@ def get_buyback_programs(ticker: str) -> list[dict]:
         "ORDER BY PERIOD_END",
         (ticker.upper(),),
     )
+
+
+# ---------------------------------------------------------------------------
+# Local dilution watchlist (user-managed from the Streamlit sidebar)
+# ---------------------------------------------------------------------------
+
+
+def ensure_dilution_watchlist_table():
+    """Create the DILUTION_WATCHLIST table if it doesn't exist."""
+    _execute_no_fetch(
+        "CREATE TABLE IF NOT EXISTS DILUTION_WATCHLIST ("
+        "  TICKER VARCHAR(10) PRIMARY KEY,"
+        "  COMPANY_NAME VARCHAR(256) NOT NULL,"
+        "  CIK VARCHAR(20) NOT NULL,"
+        "  EXCHANGE VARCHAR(50),"
+        "  ADDED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),"
+        "  ACTIVE BOOLEAN DEFAULT TRUE"
+        ")"
+    )
+
+
+def get_dilution_watchlist() -> list[dict]:
+    """Read the local dilution watchlist."""
+    try:
+        return _execute(
+            "SELECT TICKER, COMPANY_NAME, CIK, EXCHANGE "
+            "FROM DILUTION_WATCHLIST "
+            "WHERE ACTIVE = TRUE ORDER BY TICKER"
+        )
+    except Exception as e:
+        logger.warning(f"Could not read dilution watchlist: {e}")
+        return []
+
+
+def add_to_dilution_watchlist(
+    ticker: str, company_name: str, cik: str, exchange: str = ""
+) -> bool:
+    """Add a company to the local dilution watchlist.
+
+    Returns True if inserted, False if already present.
+    """
+    rows = _execute_no_fetch(
+        "INSERT INTO DILUTION_WATCHLIST (TICKER, COMPANY_NAME, CIK, EXCHANGE) "
+        "SELECT %s, %s, %s, %s "
+        "WHERE NOT EXISTS ("
+        "  SELECT 1 FROM DILUTION_WATCHLIST WHERE TICKER = %s AND ACTIVE = TRUE"
+        ")",
+        (ticker.upper(), company_name, cik, exchange, ticker.upper()),
+    )
+    if rows == 0:
+        # May be a soft-deleted row — reactivate it
+        reactivated = _execute_no_fetch(
+            "UPDATE DILUTION_WATCHLIST SET ACTIVE = TRUE, "
+            "  COMPANY_NAME = %s, CIK = %s, EXCHANGE = %s "
+            "WHERE TICKER = %s AND ACTIVE = FALSE",
+            (company_name, cik, exchange, ticker.upper()),
+        )
+        return reactivated > 0
+    return rows > 0
+
+
+def remove_from_dilution_watchlist(ticker: str) -> bool:
+    """Soft-delete a company from the local dilution watchlist.
+
+    Returns True if a row was deactivated.
+    """
+    rows = _execute_no_fetch(
+        "UPDATE DILUTION_WATCHLIST SET ACTIVE = FALSE WHERE TICKER = %s AND ACTIVE = TRUE",
+        (ticker.upper(),),
+    )
+    return rows > 0
