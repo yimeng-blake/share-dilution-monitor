@@ -615,17 +615,24 @@ def get_buyback_programs(ticker: str) -> list[dict]:
 
 
 def ensure_dilution_watchlist_table():
-    """Create the DILUTION_WATCHLIST table if it doesn't exist."""
-    _execute_no_fetch(
-        "CREATE TABLE IF NOT EXISTS DILUTION_WATCHLIST ("
-        "  TICKER VARCHAR(10) PRIMARY KEY,"
-        "  COMPANY_NAME VARCHAR(256) NOT NULL,"
-        "  CIK VARCHAR(20) NOT NULL,"
-        "  EXCHANGE VARCHAR(50),"
-        "  ADDED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),"
-        "  ACTIVE BOOLEAN DEFAULT TRUE"
-        ")"
-    )
+    """Create the DILUTION_WATCHLIST table if it doesn't exist.
+
+    Silently succeeds if the table already exists or if the current role
+    lacks CREATE TABLE privileges (the table should be pre-created by an admin).
+    """
+    try:
+        _execute_no_fetch(
+            "CREATE TABLE IF NOT EXISTS DILUTION_WATCHLIST ("
+            "  TICKER VARCHAR(10) PRIMARY KEY,"
+            "  COMPANY_NAME VARCHAR(256) NOT NULL,"
+            "  CIK VARCHAR(20) NOT NULL,"
+            "  EXCHANGE VARCHAR(50),"
+            "  ADDED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),"
+            "  ACTIVE BOOLEAN DEFAULT TRUE"
+            ")"
+        )
+    except Exception as e:
+        logger.info(f"Skipping DILUTION_WATCHLIST creation (may already exist): {e}")
 
 
 def get_dilution_watchlist() -> list[dict]:
