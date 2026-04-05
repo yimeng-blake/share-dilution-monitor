@@ -724,7 +724,7 @@ def _get_github_pat() -> Optional[str]:
             return pat
     except Exception:
         pass
-    return os.environ.get("GITHUB_PAT")
+    return os.environ.get("GH_DISPATCH_PAT")
 
 
 def trigger_cross_app_ingestion(ticker: str, source_monitor: str):
@@ -738,7 +738,7 @@ def trigger_cross_app_ingestion(ticker: str, source_monitor: str):
 
     pat = _get_github_pat()
     if not pat:
-        logger.warning("GITHUB_PAT not configured — skipping cross-app dispatch")
+        logger.warning("GH_DISPATCH_PAT not configured — skipping cross-app dispatch")
         return
 
     monitors = _execute(
