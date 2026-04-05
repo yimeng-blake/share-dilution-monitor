@@ -39,9 +39,6 @@ page = st.sidebar.radio(
     ["Search", "Watchlist Overview"],
 )
 
-# --- Ensure local watchlist table exists ---
-sf.ensure_dilution_watchlist_table()
-
 # --- Sidebar: Manage Watchlist ---
 st.sidebar.divider()
 st.sidebar.subheader("Manage Watchlist")
@@ -60,7 +57,7 @@ if st.sidebar.button("Add to Watchlist", use_container_width=True):
             if not company:
                 st.error(f"Could not find '{new_ticker}' on SEC EDGAR.")
             else:
-                added = sf.add_to_dilution_watchlist(
+                added = sf.add_to_watchlist(
                     ticker=company["ticker"],
                     company_name=company["name"],
                     cik=company["cik"],
@@ -73,15 +70,15 @@ if st.sidebar.button("Add to Watchlist", use_container_width=True):
                 else:
                     st.warning(f"{company['ticker']} is already on the watchlist.")
 
-# Display current local watchlist with remove buttons
-local_watchlist = sf.get_dilution_watchlist()
-if local_watchlist:
-    st.sidebar.caption(f"{len(local_watchlist)} company(ies) on your watchlist")
-    for entry in local_watchlist:
+# Display current watchlist with remove buttons
+current_watchlist = sf.get_watchlist()
+if current_watchlist:
+    st.sidebar.caption(f"{len(current_watchlist)} company(ies) on your watchlist")
+    for entry in current_watchlist:
         col_name, col_btn = st.sidebar.columns([3, 1])
         col_name.markdown(f"**{entry['TICKER']}**")
         if col_btn.button("X", key=f"rm_{entry['TICKER']}", help=f"Remove {entry['TICKER']}"):
-            sf.remove_from_dilution_watchlist(entry["TICKER"])
+            sf.remove_from_watchlist(entry["TICKER"])
             st.cache_data.clear()
             st.rerun()
 else:
@@ -185,14 +182,9 @@ if page == "Search":
         """Merge watchlist and ingested tickers into a deduplicated list."""
         options = {}  # ticker -> display name
 
-        for row in sf.get_insider_watchlist():
+        for row in sf.get_watchlist():
             t = row["TICKER"]
             options[t] = f"{t} — {row['COMPANY_NAME']}"
-
-        for row in sf.get_dilution_watchlist():
-            t = row["TICKER"]
-            if t not in options:
-                options[t] = f"{t} — {row['COMPANY_NAME']}"
 
         for row in sf.get_all_ingested_tickers():
             t = row["TICKER"]
@@ -786,46 +778,24 @@ if page == "Search":
 elif page == "Watchlist Overview":
     st.header("Watchlist Overview")
     st.caption(
-        "Companies from your Insider Monitor watchlist and your local watchlist. "
+        "Companies tracked across all monitors. "
         "Select any to view dilution data."
     )
 
-    # Read from insider monitor watchlist
-    watchlist = sf.get_insider_watchlist()
-    dilution_wl = sf.get_dilution_watchlist()
+    watchlist = sf.get_watchlist()
     ingested = sf.get_all_ingested_tickers()
     ingested_map = {r["TICKER"]: r for r in ingested}
 
-    # --- Local (Dilution Monitor) watchlist ---
-    if dilution_wl:
-        st.subheader("My Watchlist")
-        dwl_df = pd.DataFrame(dilution_wl)
-        dwl_df.columns = [c.lower() for c in dwl_df.columns]
-        dwl_df["status"] = dwl_df["ticker"].apply(
-            lambda t: ingested_map.get(t, {}).get("STATUS", "Not ingested")
-        )
-        dwl_df["last_updated"] = dwl_df["ticker"].apply(
-            lambda t: str(ingested_map.get(t, {}).get("LAST_INGESTED_AT", "-"))[:19]
-        )
-        display_dwl = dwl_df[["ticker", "company_name", "status", "last_updated"]].copy()
-        display_dwl.columns = ["Ticker", "Company", "Dilution Data Status", "Last Updated"]
-        st.dataframe(display_dwl, use_container_width=True, hide_index=True)
-        st.divider()
-
-    # --- Insider Monitor watchlist ---
     if watchlist:
-        st.subheader("Insider Monitor Watchlist")
+        st.subheader("Watchlist")
         wl_df = pd.DataFrame(watchlist)
         wl_df.columns = [c.lower() for c in wl_df.columns]
-
-        # Add ingestion status
         wl_df["status"] = wl_df["ticker"].apply(
             lambda t: ingested_map.get(t, {}).get("STATUS", "Not ingested")
         )
         wl_df["last_updated"] = wl_df["ticker"].apply(
             lambda t: str(ingested_map.get(t, {}).get("LAST_INGESTED_AT", "-"))[:19]
         )
-
         display = wl_df[["ticker", "company_name", "status", "last_updated"]].copy()
         display.columns = ["Ticker", "Company", "Dilution Data Status", "Last Updated"]
         st.dataframe(display, use_container_width=True, hide_index=True)
@@ -849,20 +819,17 @@ elif page == "Watchlist Overview":
                         ingest_company(ticker)
                     progress.progress((i + 1) / len(not_ingested))
                 st.rerun()
-    if not watchlist and not dilution_wl:
+    else:
         st.info(
             "No watchlist companies found. Use the sidebar to add tickers to your watchlist, "
             "or search for a company on the Search page."
         )
 
-    # Also show any companies ingested directly (not in either watchlist)
-    all_wl_tickers = (
-        {w.get("TICKER", "") for w in watchlist}
-        | {w.get("TICKER", "") for w in dilution_wl}
-    )
+    # Also show any companies ingested directly (not on the watchlist)
+    wl_tickers = {w.get("TICKER", "") for w in watchlist}
     extra = [
         r for r in ingested
-        if r["TICKER"] not in all_wl_tickers
+        if r["TICKER"] not in wl_tickers
     ]
     if extra:
         st.divider()

@@ -3,7 +3,7 @@
 Provides connection management and CRUD operations for:
 - DILUTED_SHARES, BASIC_SHARES, BUYBACK_ACTIVITY, BUYBACK_PROGRAMS, INGESTION_LOG
 
-Also reads from INSIDER_MONITOR.PUBLIC.WATCHLIST for cross-product integration.
+Watchlist operations use the centralised WATCHLIST_HUB.PUBLIC.COMPANIES table.
 """
 
 import logging
@@ -150,21 +150,56 @@ def _execute_no_fetch(sql: str, params=None) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Cross-product: read watchlist from INSIDER_MONITOR
+# Centralised watchlist (WATCHLIST_HUB)
 # ---------------------------------------------------------------------------
 
 
-def get_insider_watchlist() -> list[dict]:
-    """Read the shared watchlist from INSIDER_MONITOR database."""
+def get_watchlist() -> list[dict]:
+    """Read the global watchlist from WATCHLIST_HUB."""
     try:
         return _execute(
             "SELECT TICKER, COMPANY_NAME, CIK, EXCHANGE "
-            "FROM INSIDER_MONITOR.PUBLIC.WATCHLIST "
+            "FROM WATCHLIST_HUB.PUBLIC.COMPANIES "
             "WHERE ACTIVE = TRUE ORDER BY TICKER"
         )
     except Exception as e:
-        logger.warning(f"Could not read insider watchlist: {e}")
+        logger.warning(f"Could not read watchlist: {e}")
         return []
+
+
+def add_to_watchlist(
+    ticker: str, company_name: str, cik: str, exchange: str = ""
+) -> bool:
+    """Add a company to the centralised watchlist.
+
+    Returns True if inserted or reactivated, False if already active.
+    """
+    rows = _execute_no_fetch(
+        "MERGE INTO WATCHLIST_HUB.PUBLIC.COMPANIES tgt "
+        "USING (SELECT %s AS TICKER) src ON tgt.TICKER = src.TICKER "
+        "WHEN MATCHED AND tgt.ACTIVE = FALSE THEN UPDATE SET "
+        "  ACTIVE = TRUE, COMPANY_NAME = %s, CIK = %s, EXCHANGE = %s, "
+        "  ADDED_AT = CURRENT_TIMESTAMP(), ADDED_BY = 'dilution_monitor' "
+        "WHEN NOT MATCHED THEN INSERT "
+        "  (TICKER, COMPANY_NAME, CIK, EXCHANGE, ADDED_BY) "
+        "  VALUES (%s, %s, %s, %s, 'dilution_monitor')",
+        (ticker.upper(), company_name, cik, exchange,
+         ticker.upper(), company_name, cik, exchange),
+    )
+    return rows > 0
+
+
+def remove_from_watchlist(ticker: str) -> bool:
+    """Soft-delete a company from the centralised watchlist.
+
+    Returns True if a row was deactivated.
+    """
+    rows = _execute_no_fetch(
+        "UPDATE WATCHLIST_HUB.PUBLIC.COMPANIES SET ACTIVE = FALSE "
+        "WHERE TICKER = %s AND ACTIVE = TRUE",
+        (ticker.upper(),),
+    )
+    return rows > 0
 
 
 # ---------------------------------------------------------------------------
@@ -608,80 +643,3 @@ def get_buyback_programs(ticker: str) -> list[dict]:
         (ticker.upper(),),
     )
 
-
-# ---------------------------------------------------------------------------
-# Local dilution watchlist (user-managed from the Streamlit sidebar)
-# ---------------------------------------------------------------------------
-
-
-def ensure_dilution_watchlist_table():
-    """Create the DILUTION_WATCHLIST table if it doesn't exist.
-
-    Silently succeeds if the table already exists or if the current role
-    lacks CREATE TABLE privileges (the table should be pre-created by an admin).
-    """
-    try:
-        _execute_no_fetch(
-            "CREATE TABLE IF NOT EXISTS DILUTION_WATCHLIST ("
-            "  TICKER VARCHAR(10) PRIMARY KEY,"
-            "  COMPANY_NAME VARCHAR(256) NOT NULL,"
-            "  CIK VARCHAR(20) NOT NULL,"
-            "  EXCHANGE VARCHAR(50),"
-            "  ADDED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),"
-            "  ACTIVE BOOLEAN DEFAULT TRUE"
-            ")"
-        )
-    except Exception as e:
-        logger.info(f"Skipping DILUTION_WATCHLIST creation (may already exist): {e}")
-
-
-def get_dilution_watchlist() -> list[dict]:
-    """Read the local dilution watchlist."""
-    try:
-        return _execute(
-            "SELECT TICKER, COMPANY_NAME, CIK, EXCHANGE "
-            "FROM DILUTION_WATCHLIST "
-            "WHERE ACTIVE = TRUE ORDER BY TICKER"
-        )
-    except Exception as e:
-        logger.warning(f"Could not read dilution watchlist: {e}")
-        return []
-
-
-def add_to_dilution_watchlist(
-    ticker: str, company_name: str, cik: str, exchange: str = ""
-) -> bool:
-    """Add a company to the local dilution watchlist.
-
-    Returns True if inserted, False if already present.
-    """
-    rows = _execute_no_fetch(
-        "INSERT INTO DILUTION_WATCHLIST (TICKER, COMPANY_NAME, CIK, EXCHANGE) "
-        "SELECT %s, %s, %s, %s "
-        "WHERE NOT EXISTS ("
-        "  SELECT 1 FROM DILUTION_WATCHLIST WHERE TICKER = %s AND ACTIVE = TRUE"
-        ")",
-        (ticker.upper(), company_name, cik, exchange, ticker.upper()),
-    )
-    if rows == 0:
-        # May be a soft-deleted row — reactivate it
-        reactivated = _execute_no_fetch(
-            "UPDATE DILUTION_WATCHLIST SET ACTIVE = TRUE, "
-            "  COMPANY_NAME = %s, CIK = %s, EXCHANGE = %s "
-            "WHERE TICKER = %s AND ACTIVE = FALSE",
-            (company_name, cik, exchange, ticker.upper()),
-        )
-        return reactivated > 0
-    return rows > 0
-
-
-def remove_from_dilution_watchlist(ticker: str) -> bool:
-    """Soft-delete a company from the local dilution watchlist.
-
-    Returns True if a row was deactivated.
-    """
-    rows = _execute_no_fetch(
-        "UPDATE DILUTION_WATCHLIST SET ACTIVE = FALSE WHERE TICKER = %s AND ACTIVE = TRUE",
-        (ticker.upper(),),
-    )
-    return rows > 0

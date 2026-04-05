@@ -80,15 +80,12 @@ def main():
         tickers = specific_tickers
         logger.info(f"Ingesting specific tickers: {tickers}")
     else:
-        # Get all tracked tickers from ingestion log + insider watchlist
+        # Get all tracked tickers from ingestion log + centralised watchlist
         ingested = sf.get_all_ingested_tickers()
         ingested_tickers = {r["TICKER"] for r in ingested}
 
-        try:
-            watchlist = sf.get_insider_watchlist()
-            watchlist_tickers = {r["TICKER"] for r in watchlist}
-        except Exception:
-            watchlist_tickers = set()
+        watchlist = sf.get_watchlist()
+        watchlist_tickers = {r["TICKER"] for r in watchlist}
 
         tickers = sorted(ingested_tickers | watchlist_tickers)
         logger.info(
