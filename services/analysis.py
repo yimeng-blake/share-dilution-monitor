@@ -156,7 +156,7 @@ def _fix_split_outliers(
         return df
 
     df = df.copy()
-    values = df[share_col].astype(float).values
+    values = df[share_col].astype(float).values.copy()
     n = len(values)
     split_ratios = sorted(set(s["ratio"] for s in splits), reverse=True)
 
@@ -245,7 +245,7 @@ def _fix_scale_outliers(
         return df
 
     df = df.copy()
-    values = df[share_col].astype(float).values
+    values = df[share_col].astype(float).values.copy()
     n = len(values)
     window = max(5, n // 6)
 
